@@ -23,6 +23,8 @@
 # Executables
 *.out
 
-
 # Credentials file
 src/credentials.h
+
+# Platformio output
+.pio
