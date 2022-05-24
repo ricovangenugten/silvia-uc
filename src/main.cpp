@@ -1,33 +1,62 @@
+
 #include <Wire.h>
 #include <Adafruit_I2CDevice.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSans9pt7b.h>
 #include <max6675.h>
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
+#include "ArduinoOTA.h"
 
 #include "credentials.h"
 
-#define SCREEN_WIDTH 128 // OLED display width, in pixels
-#define SCREEN_HEIGHT 64 // OLED display height, in pixels
-#define SCREEN_ADDRESS 0x3D
-#define OLED_RESET -1
+// Screen settings
+static const int screen_width   = 128; // OLED display width, in pixels
+static const int screen_height  = 64; // OLED display height, in pixels
+static const int screen_address = 0x3c;
+static const int screen_reset   = -1;
+
+// Scheduling related numbers
+static const uint tick_ms = 10;
+static const uint display_ticks      = 100; // 1000 ms
+static const uint temp_meas_ticks    = 25;  //  250 ms
+static const uint temp_send_ticks    = 1000;  // 10 s
+static const uint mqtt_connect_ticks = 1000;  // 10 s
+
+static const uint auto_off_period = 3600e3;  // 1 hour
+
+static const uint temp_meas_history = 2;
 
 // pin definitions
-int powerSw = D7; // GPIO13, shared with SPI MOSI
-int pumpSw  = D3; // GPIO0, pulled up
+static const int ktcCLK  = D5; // GPIO14
+static const int ktcSO   = D6; // GPIO12
+static const int ktcCS   = D8; // GPIO15
 
-// Declaration for an SSD1306 display connected to I2C
-//  OLED SCL  D1  // GPIO5
-//  OLED SDA  D2  // GPIO4
+#if BOARD_ID == 1
 
-int pumpRly = D0; // GPIO16, HIGH at boot
-int heatRly = D4; // GPIO2, HIGH at boot, pulled up, connected to onboard led
+static const int sclPin  = D1; // GPIO5
+static const int sdaPin  = D2; // GPIO4
 
-int ktcCLK  = D5; // GPIO14
-int ktcSO   = D6; // GPIO12
-int ktcCS   = D8; // GPIO15
+static const int pumpRly = D7; // GPIO13
+static const int heatRly = D0; // GPIO16, HIGH at boot
+
+static const int pumpSw  = D3; // GPIO0, pulled up
+static const int powerSw = D4; // GPIO2, HIGH at boot, pulled up, connected to onboard led
+
+#elif BOARD_ID == 2
+
+static const int sclPin  = D3; // GPIO0
+static const int sdaPin  = D4; // GPIO2
+
+static const int pumpRly = D2; // GPIO4
+static const int heatRly = D1; // GPIO5
+
+static const int pumpSw  = D7; // GPIO13
+static const int powerSw = D0; // GPIO16
+
+#endif
 
 class Relay
 {
@@ -35,21 +64,29 @@ public:
   Relay(int pin, const char* name) :
     mPin(pin),
     mName(name),
-    mState(false)
+    mState(false),
+    mDeadTime(0)
   {
   }
 
   void Init()
   {
-    digitalWrite(mPin, HIGH);
+    digitalWrite(mPin, LOW);
     pinMode(mPin,      OUTPUT);
+  }
+
+  bool GetState()
+  {
+    return mState;
   }
 
   void SetState(bool state)
   {
-    if (state != mState)
+    unsigned long curTime = millis();
+    if (state != mState && curTime > mDeadTime)
     {
-      digitalWrite(mPin, state ? LOW : HIGH);
+      // Only switch once every second max
+      digitalWrite(mPin, state ? HIGH : LOW);
       Serial.print("Relay ");
       Serial.print(mName);
       if (state)
@@ -61,12 +98,15 @@ public:
         Serial.print(" off\n");
       }
       mState = state;
+      mDeadTime = curTime + 1000;
     }
   }
+
 private:
   uint mPin;
   const char* mName;
   bool mState;
+  unsigned long mDeadTime;
 };
 
 class Button
@@ -133,7 +173,10 @@ public:
 
   StateMachine(PubSubClient& mqttClient) :
     mState(EStateDisconnected),
-    mMqttClient(mqttClient)
+    mPrevState(EStateDisconnected),
+    mMqttClient(mqttClient),
+    mStateTransTime(0),
+    mPrevStateDuration(0.0)
   {}
 
   EState GetState()
@@ -145,13 +188,31 @@ public:
   {
     if (state != mState)
     {
+      // Store prev state details
+      mPrevState = mState;
+      mPrevStateDuration = GetTimeInState();
+
+      // Do state transition
+      mStateTransTime = millis();
       mState = state;
-      const char* state_str = GetStateStr();
-      mMqttClient.publish("silvia/state", state_str, true);
-      Serial.print("State change to ");
-      Serial.print(state_str);
-      Serial.println();
+
+      PublishState();
     }
+  }
+
+  void PublishState()
+  {
+    const char* state_str = GetStateStr();
+    mMqttClient.publish(mqtt_state_topic, state_str, true);
+    Serial.print("State change to ");
+    Serial.print(state_str);
+    Serial.println();
+  }
+
+  float GetTimeInState()
+  {
+    unsigned long time_ms = millis() - mStateTransTime;
+    return (time_ms / 1000.0);
   }
 
   static const char* GetStateStr(EState state)
@@ -167,6 +228,37 @@ public:
     return state_str;
   }
 
+  const char* GetDisplayStr(bool heater_on, float temp)
+  {
+    const char* state_str = nullptr;
+    static char state_str_buf[16];
+    bool is_warm = (temp > 80.0f);
+
+    if (mPrevState == EStatePumpOn && GetTimeInState() < 10.0)
+    {
+      snprintf(state_str_buf, sizeof(state_str_buf), "End: %.1f s", mPrevStateDuration);
+      state_str = state_str_buf;
+    }
+    else
+    {
+      switch(mState)
+      {
+        case EStateDisconnected: // intentional fall through
+        case EStatePowerOff:
+          state_str = "Off";
+          break;
+        case EStatePowerOn:
+          state_str = is_warm ? (heater_on ? "Heating.." : "Ready") : "Not ready";
+          break;
+        case EStatePumpOn:
+          snprintf(state_str_buf, sizeof(state_str_buf), "Shot: %.1f s", GetTimeInState());
+          state_str = state_str_buf;
+          break;
+      }
+    }
+    return state_str;
+  }
+
   const char* GetStateStr()
   {
     return GetStateStr(mState);
@@ -174,12 +266,15 @@ public:
 
   void Init()
   {
-    SetState(EStatePowerOff);
+    SetState(EStatePowerOn);
   }
 
 private:
   EState mState;
+  EState mPrevState;
   PubSubClient& mMqttClient;
+  unsigned long mStateTransTime;
+  float mPrevStateDuration;
 };
 
 class TempSensor
@@ -189,34 +284,67 @@ public:
     mKtc(ktc),
     mMqttClient(mqttClient),
     mTemp(0.0)
-  {}
-
-  double& MeasureTemp()
   {
-    double curTemp = mKtc.readCelsius();
-    // TODO: remove this when thermocouple is connected
-    curTemp = 91.12345;
-    if (curTemp != mTemp)
+    for (uint calc_id=0; calc_id<temp_meas_history;++calc_id)
     {
-      mTemp = curTemp;
-      static char temp_str[8];
-      snprintf(temp_str, sizeof(temp_str), "%.2f", mTemp);
-      mMqttClient.publish("silvia/temp", temp_str);
-      Serial.print("Temp change to ");
-      Serial.print(mTemp);
-      Serial.println();
+      mTempHistory[calc_id] = 0.0f;
     }
+  }
+
+  float& MeasureTemp()
+  {
+    static int store_id = 0;
+
+    // store measurement in ringbuffer
+    mTempHistory[store_id++] = mKtc.readCelsius();
+    if (store_id == temp_meas_history)
+    {
+      store_id = 0;
+    }
+
+    // average over history
+    mTemp = 0.0f;
+    for (uint calc_id=0; calc_id<temp_meas_history;++calc_id)
+    {
+      mTemp += mTempHistory[calc_id];
+    }
+    mTemp /= temp_meas_history;
+
+    // simple moving average
+    //mTemp = 0.7 * mTemp + 0.3 * curTemp;
+
     return mTemp;
+  }
+
+  char* GetTempStr()
+  {
+    static char temp_str[8];
+    //snprintf(temp_str, sizeof(temp_str), "%.1f", mTemp);
+    snprintf(temp_str, sizeof(temp_str), "%.0f", roundf(mTemp));
+    return temp_str;
+  }
+
+  void PublishTemp()
+  {
+    static char json_str[64];
+
+    snprintf(json_str, sizeof(json_str), "{\"temperature\": %0.1f}", mTemp);
+    mMqttClient.publish(mqtt_temp_topic, json_str);
+
+    Serial.print("Temp change to ");
+    Serial.print(mTemp);
+    Serial.println();
   }
 
 private:
   MAX6675& mKtc;
   PubSubClient& mMqttClient;
-  double mTemp;
+  float mTemp;
+  float mTempHistory[temp_meas_history];
 };
 
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_SSD1306 display(screen_width, screen_height, &Wire, screen_reset);
 
 MAX6675 ktc(ktcCLK, ktcCS, ktcSO);
 
@@ -235,6 +363,7 @@ TempSensor tempSensor(ktc, mqttClient);
 
 void print_start()
 {
+  display.clearDisplay();
   display.setCursor(0,20);
 }
 
@@ -249,6 +378,18 @@ void print_end()
 {
   Serial.println();
   display.display();
+}
+
+void mqttConnect()
+{
+  if (mqttClient.connect(
+        wifi_hostname, mqtt_user, mqtt_pass,
+        mqtt_state_topic, 0, true,
+        StateMachine::GetStateStr(StateMachine::EStateDisconnected)))
+  {
+    mqttClient.subscribe(mqtt_set_topic);
+    stateMachine.PublishState();
+  }
 }
 
 void mqttCallbackProcessPayload(byte* payload, uint length, StateMachine::EState state)
@@ -267,6 +408,12 @@ void mqttCallback(char* topic, byte* payload, uint length)
 
 void setup()
 {
+  // Has to happen first
+  WiFi.hostname(wifi_hostname);
+
+  // Initialize i2c
+  Wire.begin(sdaPin, sclPin);
+
   // Set input and output pins
   heatRelay.Init();
   pumpRelay.Init();
@@ -278,7 +425,7 @@ void setup()
   Serial.begin(115200);
 
   // Start Screen
-  if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS))
+  if(!display.begin(SSD1306_SWITCHCAPVCC, screen_address))
   {
     Serial.println("SSD1306 allocation failed");
     for(;;);
@@ -289,83 +436,99 @@ void setup()
   display.setTextSize(1);
   display.setTextColor(WHITE);
 
+  if (mqtt_enabled)
+  {
+    mqttClient.setServer(mqtt_server, mqtt_port);
+    mqttClient.setCallback(mqttCallback);
+  }
+
   if (wifi_enabled)
   {
     WiFi.begin(wifi_ssid, wifi_pass);
 
     print_start();
-    print_add("Connecting to WiFi");
+    print_add("Connecting to WiFi..");
     print_end();
 
-    while (WiFi.status() != WL_CONNECTED)
+    // Block untill connected, try for 5 seconds max
+    uint tries = 0;
+    while (WiFi.status() != WL_CONNECTED && tries++ < 50)
     {
       delay(100);
       if (WiFi.status() == WL_CONNECT_FAILED)
       {
-        print_start();
-        print_add("Could not connect to WiFi");
-        print_end();
         break;
       }
-    }
-
-    if (WiFi.status() == WL_CONNECTED)
-    {
-      print_start();
-      print_add("IP address: ");
-      print_add(WiFi.localIP());
-      print_end();
     }
   }
 
   if (WiFi.status() == WL_CONNECTED && mqtt_enabled)
   {
-    mqttClient.setServer(mqtt_server, mqtt_port);
-    mqttClient.setCallback(mqttCallback);
-
     print_start();
-    print_add("Connecting to MQTT");
+    print_add("Connecting to MQTT..");
     print_end();
 
-    if (mqttClient.connect(
-          "SilviaESP8266", mqtt_user, mqtt_pass,
-          "silvia/state", 0, true, StateMachine::GetStateStr(StateMachine::EStateDisconnected)))
-    {
-      print_start();
-      print_add("Connected!");
-      print_end();
-      mqttClient.subscribe("silvia/set");
-    }
-    else
-    {
-      print_start();
-      print_add("MQTT connect failed: ");
-      print_add(mqttClient.state());
-      print_end();
-    }
+    mqttConnect();
   }
+
 
   //Init statemachine last so it can broadcast its state via mqtt
   stateMachine.Init();
+
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = "sketch";
+    } else { // U_FS
+      type = "filesystem";
+    }
+
+    // NOTE: if updating FS this would be the place to unmount FS using FS.end()
+    Serial.println("Start updating " + type);
+  });
+
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd");
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    Serial.printf("Progress: %u%%\r", (progress / (total / 100)));
+  });
+
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) {
+      Serial.println("Auth Failed");
+    } else if (error == OTA_BEGIN_ERROR) {
+      Serial.println("Begin Failed");
+    } else if (error == OTA_CONNECT_ERROR) {
+      Serial.println("Connect Failed");
+    } else if (error == OTA_RECEIVE_ERROR) {
+      Serial.println("Receive Failed");
+    } else if (error == OTA_END_ERROR) {
+      Serial.println("End Failed");
+    }
+  });
+
+  ArduinoOTA.begin();
 }
+
+float temp_set = 91.0;
+
+uint next_tick_ms = 0;
+uint tick = 0;
+
+float temp = 0.0;
+
+unsigned long auto_off_time = 0;
 
 void loop()
 {
-  const uint tick_ms = 10;
-  const uint display_ticks    = 50;  // 500 ms
-  const uint controller_ticks = 10; //  100 ms
+    ArduinoOTA.handle();
 
-  const double temp_set = 95.0;
-  const double temp_hyst = 0.5;
+    auto time = millis();
 
-  uint next_tick_ms = 0;
-  uint tick = 0;
-
-  double temp = 0.0;
-
-  while (1)
-  {
-    if (millis() > next_tick_ms)
+    if (time > next_tick_ms)
     {
       // Progress tick
       next_tick_ms += tick_ms;
@@ -392,27 +555,14 @@ void loop()
             StateMachine::EStatePowerOn);
       }
 
-      // Handle MQTT
+      // Handle MQTT messages
       mqttClient.loop();
 
-      // Handle display
-      if (tick % display_ticks == 0)
+      // Handle temp controller
+      if (tick % temp_meas_ticks == 0)
       {
-	// Read temp
         temp = tempSensor.MeasureTemp();
 
-	// Update display
-        display.setCursor(0,20);
-        display.print("Temp: ");
-        display.print(temp);
-        display.print(" C ");
-        display.print(stateMachine.GetStateStr());
-        display.display();
-      }
-
-      // Handle temp controller
-      if (tick % controller_ticks == 0)
-      {
         switch (stateMachine.GetState())
         {
           case StateMachine::EStatePumpOn:
@@ -432,15 +582,28 @@ void loop()
 
             // do temp control
             if (isnan(temp) ||
-                temp > (temp_set + temp_hyst))
+                temp > temp_set)
             {
               // heater off
               heatRelay.SetState(false);
+              // If we reach this point the heater is powered
+              // so start the auto off timer
+              if (auto_off_time == 0)
+              {
+                auto_off_time = time + auto_off_period;
+              }
             }
-            else if (temp < (temp_set - temp_hyst))
+            else
             {
               // heater on
               heatRelay.SetState(true);
+            }
+
+            if (auto_off_time > 0 && time > auto_off_time)
+            {
+              // If auto off period exceeded, switch off
+              stateMachine.SetState(StateMachine::EStatePowerOff);
+              auto_off_time = 0;
             }
           }
           break;
@@ -454,7 +617,43 @@ void loop()
           break;
         }
       }
+
+      // Handle display
+      if (tick % display_ticks == 0)
+      {
+	      // Update display
+        display.clearDisplay();
+        display.setCursor(0,20);
+        display.setFont(&FreeSansBold12pt7b);
+        display.print(tempSensor.GetTempStr());
+        display.print(" °C");
+        display.setCursor(0,50);
+        display.setFont(&FreeSans9pt7b);
+        display.print(stateMachine.GetDisplayStr(heatRelay.GetState(), temp));
+        if (WiFi.status() != WL_CONNECTED)
+          display.print(" no WiFi");
+        else if (not mqttClient.connected())
+          display.print(" no MQTT");
+        display.display();
+      }
+
+      if (tick % temp_send_ticks == 0)
+      {
+        tempSensor.PublishTemp();
+      }
+
+      // Handle MQTT reconnect
+      if (tick % mqtt_connect_ticks == 0)
+      {
+        if (mqtt_enabled &&                       // If mqtt is enabled
+            heatRelay.GetState() == false &&      // and heat relay is powered off
+            WiFi.status() == WL_CONNECTED &&      // and wifi is connected
+            !mqttClient.connected())              // but mqtt is disconnected
+        {
+          // Reconnect MQTT (blocking)
+          mqttConnect();
+        }
+      }
     }
     delay(1);
-  }
 }
