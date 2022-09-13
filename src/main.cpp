@@ -20,12 +20,12 @@ static const int screen_reset   = -1;
 
 // Scheduling related numbers
 static const uint tick_ms = 10;
-static const uint display_ticks      = 100; // 1000 ms
-static const uint temp_meas_ticks    = 25;  //  250 ms
+static const uint display_ticks      = 100;   // 1 s
+static const uint temp_meas_ticks    = 25;    // 250 ms
 static const uint temp_send_ticks    = 1000;  // 10 s
 static const uint mqtt_connect_ticks = 1000;  // 10 s
 
-static const uint auto_off_period = 3600e3;  // 1 hour
+static const uint auto_off_time = 3600;  // 1 hour
 
 static const uint temp_meas_history = 2;
 
@@ -43,7 +43,6 @@ static const int pumpRly = D7; // GPIO13
 static const int heatRly = D0; // GPIO16, HIGH at boot
 
 static const int pumpSw  = D3; // GPIO0, pulled up
-static const int powerSw = D4; // GPIO2, HIGH at boot, pulled up, connected to onboard led
 
 #elif BOARD_ID == 2
 
@@ -54,18 +53,18 @@ static const int pumpRly = D2; // GPIO4
 static const int heatRly = D1; // GPIO5
 
 static const int pumpSw  = D7; // GPIO13
-static const int powerSw = D0; // GPIO16
 
 #endif
 
 class Relay
 {
 public:
-  Relay(int pin, const char* name) :
+  Relay(int pin, const char* name, unsigned long dead_time_interval) :
     mPin(pin),
     mName(name),
     mState(false),
-    mDeadTime(0)
+    mDeadTime(0),
+    mDeadTimeInterval(dead_time_interval)
   {
   }
 
@@ -98,7 +97,7 @@ public:
         Serial.print(" off\n");
       }
       mState = state;
-      mDeadTime = curTime + 1000;
+      mDeadTime = curTime + mDeadTimeInterval;
     }
   }
 
@@ -107,6 +106,7 @@ private:
   const char* mName;
   bool mState;
   unsigned long mDeadTime;
+  unsigned long mDeadTimeInterval;
 };
 
 class Button
@@ -144,13 +144,6 @@ public:
     }
 
     return mDebouncedState;
-  }
-
-  bool GetDebouncedRisingEdge()
-  {
-    bool prevDebouncedState = mDebouncedState;
-    bool curDebouncedState = GetDebouncedState();
-    return (curDebouncedState == true && prevDebouncedState == false);
   }
 
 private:
@@ -232,26 +225,27 @@ public:
   {
     const char* state_str = nullptr;
     static char state_str_buf[16];
-    bool is_warm = (temp > 80.0f);
 
     if (mPrevState == EStatePumpOn && GetTimeInState() < 10.0)
     {
-      snprintf(state_str_buf, sizeof(state_str_buf), "End: %.1f s", mPrevStateDuration);
+      snprintf(state_str_buf, sizeof(state_str_buf), "Shot: %.1f s", mPrevStateDuration);
       state_str = state_str_buf;
     }
     else
     {
       switch(mState)
       {
-        case EStateDisconnected: // intentional fall through
+        case EStateDisconnected:
+          state_str = "Disconnected";
+          break;
         case EStatePowerOff:
           state_str = "Off";
           break;
         case EStatePowerOn:
-          state_str = is_warm ? (heater_on ? "Heating.." : "Ready") : "Not ready";
+          state_str = heater_on ? "Heating.." : "Ready";
           break;
         case EStatePumpOn:
-          snprintf(state_str_buf, sizeof(state_str_buf), "Shot: %.1f s", GetTimeInState());
+          snprintf(state_str_buf, sizeof(state_str_buf), "Shot: %.0f s", GetTimeInState());
           state_str = state_str_buf;
           break;
       }
@@ -351,11 +345,10 @@ MAX6675 ktc(ktcCLK, ktcCS, ktcSO);
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-Button powerButton(powerSw);
 Button pumpButton(pumpSw);
 
-Relay heatRelay(heatRly, "Heat");
-Relay pumpRelay(pumpRly, "Pump");
+Relay heatRelay(heatRly, "Heat", 1000);
+Relay pumpRelay(pumpRly, "Pump", 0);
 
 StateMachine stateMachine(mqttClient);
 
@@ -382,13 +375,18 @@ void print_end()
 
 void mqttConnect()
 {
-  if (mqttClient.connect(
-        wifi_hostname, mqtt_user, mqtt_pass,
-        mqtt_state_topic, 0, true,
-        StateMachine::GetStateStr(StateMachine::EStateDisconnected)))
+  // try max 3 times
+  for (uint i = 0; i < 4; i++)
   {
-    mqttClient.subscribe(mqtt_set_topic);
-    stateMachine.PublishState();
+    if (mqttClient.connect(
+          wifi_hostname, mqtt_user, mqtt_pass,
+          mqtt_state_topic, 0, true,
+          StateMachine::GetStateStr(StateMachine::EStateDisconnected)))
+    {
+      mqttClient.subscribe(mqtt_set_topic);
+      stateMachine.PublishState();
+      break;
+    }
   }
 }
 
@@ -418,7 +416,6 @@ void setup()
   heatRelay.Init();
   pumpRelay.Init();
 
-  powerButton.Init();
   pumpButton.Init();
 
   // Initialize serial output
@@ -520,8 +517,6 @@ uint tick = 0;
 
 float temp = 0.0;
 
-unsigned long auto_off_time = 0;
-
 void loop()
 {
     ArduinoOTA.handle();
@@ -535,18 +530,8 @@ void loop()
       tick++;
 
       // Handle button pushes
-      // Always react on power button pushes
-      if (powerButton.GetDebouncedRisingEdge() == true)
-      {
-        // If state is off, turn on. If state is not off (heat or pump on), turn off
-        stateMachine.SetState(
-           (stateMachine.GetState() == StateMachine::EStatePowerOff) ?
-             StateMachine::EStatePowerOn :
-             StateMachine::EStatePowerOff);
-      }
-
       // Only react on pump button pushes if power is not off
-      if (stateMachine.GetState() != StateMachine::EStatePowerOff)
+      if (stateMachine.GetState() != StateMachine::EStateDisconnected)
       {
         // Based on switch state, choose between heat on or pump on
         stateMachine.SetState(
@@ -586,12 +571,6 @@ void loop()
             {
               // heater off
               heatRelay.SetState(false);
-              // If we reach this point the heater is powered
-              // so start the auto off timer
-              if (auto_off_time == 0)
-              {
-                auto_off_time = time + auto_off_period;
-              }
             }
             else
             {
@@ -599,15 +578,14 @@ void loop()
               heatRelay.SetState(true);
             }
 
-            if (auto_off_time > 0 && time > auto_off_time)
+            if (stateMachine.GetTimeInState() > auto_off_time)
             {
-              // If auto off period exceeded, switch off
               stateMachine.SetState(StateMachine::EStatePowerOff);
-              auto_off_time = 0;
             }
+
           }
           break;
-          default: // EStatePowerOff and any invalid state
+          default: // EStateDisconnected and any invalid state
           {
             // heater off
             heatRelay.SetState(false);
